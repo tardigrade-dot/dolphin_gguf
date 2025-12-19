@@ -22,8 +22,9 @@ pip install 'llama-cpp-python[server]'
     --host 0.0.0.0 --port 8000
 
 需要使用到qwen_vl_utils的部分已经拷贝, 不再依赖, 因此也不需要安装pytorch
-# pip install openai pillow tqdm ipykernel pymupdf numpy opencv-python # qwen_vl_utils 去掉了该依赖, 以避免安装pytorch
-# conda install pytorch torchvision torchaudio -c pytorch
+pip install openai pillow tqdm ipykernel pymupdf numpy opencv-python 
+qwen_vl_utils 去掉了该依赖, 以避免安装pytorch
+conda install pytorch torchvision torchaudio -c pytorch
 
 使用:
 安装:pip install -e .
