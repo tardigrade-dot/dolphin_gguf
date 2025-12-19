@@ -1,0 +1,7 @@
+data_output
+build
+dolphin_gguf/__pycache__
+dolphin_gguf/tools/__pycache__
+dolphin_gguf/Dolphin2*
+Dolphin2_GGUF*
+.DS_Store

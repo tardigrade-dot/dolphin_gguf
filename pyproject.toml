@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Dolphin2_GGUF"
+version = "0.1.0"
+description = "Document Image Parsing via Heterogeneous Anchor Prompting"
+authors = [
+    { name = "ByteDance", email = "contact@bytedance.com" }
+]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "openai",
+    "pillow",
+    "tqdm",
+    "ipykernel",
+    "pymupdf",
+    "numpy",
+    "opencv-python",
+    "pdf2image",
+]
+[project.scripts]
+dolphin-ocr = "dolphin_gguf.dolphin_run:ocr"
+dolphin-combine = "dolphin_gguf.dolphin_run:combine"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 120
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''

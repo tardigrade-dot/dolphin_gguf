@@ -1,0 +1,698 @@
+"""
+Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
+SPDX-License-Identifier: MIT
+"""
+
+import io
+import json
+import os
+import re
+import math
+from dataclasses import dataclass
+from typing import Optional, Union, Tuple, List, Any, Dict, overload
+
+import cv2
+import numpy as np
+import pymupdf
+from PIL import Image, ImageOps
+# from pdf2image import convert_from_path
+# from qwen_vl_utils import smart_resize
+from .markdown_utils import MarkdownConverter
+
+MAX_RATIO = 200 # from qwen_vl_utils
+
+def round_by_factor(number: int, factor: int) -> int:
+    """Returns the closest integer to 'number' that is divisible by 'factor'."""
+    return round(number / factor) * factor
+
+
+def ceil_by_factor(number: int, factor: int) -> int:
+    """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
+    return math.ceil(number / factor) * factor
+
+
+def floor_by_factor(number: int, factor: int) -> int:
+    """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
+    return math.floor(number / factor) * factor
+
+
+def smart_resize(height: int, width: int, factor: int, min_pixels: Optional[int] = None, max_pixels: Optional[int] = None) -> Tuple[int, int]:
+    """
+    Rescales the image so that the following conditions are met:
+
+    1. Both dimensions (height and width) are divisible by 'factor'.
+    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+    3. The aspect ratio of the image is maintained as closely as possible.
+    """
+    max_pixels = max_pixels if max_pixels is not None else (IMAGE_MAX_TOKEN_NUM * factor ** 2)
+    min_pixels = min_pixels if min_pixels is not None else (IMAGE_MIN_TOKEN_NUM * factor ** 2)
+    assert max_pixels >= min_pixels, "The max_pixels of image must be greater than or equal to min_pixels."
+    if max(height, width) / min(height, width) > MAX_RATIO:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
+        )
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = floor_by_factor(height / beta, factor)
+        w_bar = floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = ceil_by_factor(height * beta, factor)
+        w_bar = ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+def map_bbox_to_original(bbox, orig_width, orig_height, factor=28, min_pixels=784, max_pixels=2560000):
+    """
+    Maps GGUF / Qwen-VL model output bbox coordinates (0-1000) back to original image pixels.
+    bbox format: (x0, y0, x1, y1)
+    """
+    resized_h, resized_w = smart_resize(orig_height, orig_width,
+                                        factor=factor,
+                                        min_pixels=min_pixels,
+                                        max_pixels=max_pixels)
+    # Map normalized coordinates to model internal pixels
+    x0_model = bbox[0] / 1000 * resized_w
+    y0_model = bbox[1] / 1000 * resized_h
+    x1_model = bbox[2] / 1000 * resized_w
+    y1_model = bbox[3] / 1000 * resized_h
+
+    # Scale to original image pixels
+    x0_pixel = x0_model * (orig_width / resized_w)
+    y0_pixel = y0_model * (orig_height / resized_h)
+    x1_pixel = x1_model * (orig_width / resized_w)
+    y1_pixel = y1_model * (orig_height / resized_h)
+
+    return x0_pixel, y0_pixel, x1_pixel, y1_pixel
+
+
+TARGET_HIGH_DIM = 1600
+
+def get_high_res_pil_image(img: Image.Image, target_max_dim: int) -> Image.Image:
+    """
+    打开图片文件，转换为 RGB，并将其缩放到指定的最大维度。
+    如果原始图像已经大于目标维度，则缩小；如果小于，则放大（插值）。
+    """
+    # 1. 处理 EXIF 旋转（推荐）
+    img = ImageOps.exif_transpose(img) 
+    
+    # 2. 确保 RGB 格式
+    img = img.convert("RGB")
+    
+    original_width, original_height = img.size
+    
+    # 如果图像的最长边已经大于或等于目标，则不放大，仅确保不超出
+    if max(original_width, original_height) <= target_max_dim:
+        return img # 原始分辨率已经足够或接近，直接返回
+
+    # 3. 计算缩放尺寸 (保持宽高比)
+    aspect_ratio = original_width / original_height
+    
+    if original_width > original_height:
+        new_width = target_max_dim
+        new_height = int(target_max_dim / aspect_ratio)
+    else:
+        new_height = target_max_dim
+        new_width = int(target_max_dim * aspect_ratio)
+
+    new_size = (new_width, new_height)
+    
+    # 4. 执行缩放（使用 LANCZOS 获得最佳质量）
+    resized_img = img.resize(new_size, resample=Image.LANCZOS)
+    
+    return resized_img
+
+def save_figure_to_local(pil_crop, save_dir, image_name, reading_order):
+    """Save cropped figure to local file system
+
+    Args:
+        pil_crop: PIL Image object of the cropped figure
+        save_dir: Base directory to save results
+        image_name: Name of the source image/document
+        reading_order: Reading order of the figure in the document
+
+    Returns:
+        str: Filename of the saved figure
+    """
+    try:
+        # Create figures directory if it doesn't exist
+        figures_dir = os.path.join(save_dir, "markdown", "figures")
+        os.makedirs(figures_dir, exist_ok=True)
+
+        # Generate figure filename
+        figure_filename = f"{image_name}_figure_{reading_order:03d}.png"
+        figure_path = os.path.join(figures_dir, figure_filename)
+
+        # Save the figure
+        pil_crop.save(figure_path, format="PNG", quality=95)
+
+        # print(f"Saved figure: {figure_filename}")
+        return figure_filename
+
+    except Exception as e:
+        print(f"Error saving figure: {str(e)}")
+        # Return a fallback filename
+        return f"{image_name}_figure_{reading_order:03d}_error.png"
+
+def convert_pdf_to_images(pdf_path, page_index=None):
+    """
+    Convert PDF pages to images without applying any target_size scaling.
+    Renders pages at their default resolution (typically 72/96 DPI).
+
+    Args:
+        pdf_path: Path to PDF file
+        page_index: (Optional) If an integer is provided, only convert that single page (0-indexed).
+
+    Returns:
+        List of PIL Images
+    """
+    images = []
+    try:
+        # 使用 fitz 库打开 PDF
+        doc = pymupdf.open(pdf_path)
+        
+        # 处理单页或全文件
+        page_range = range(len(doc))
+        if page_index is not None and 0 <= page_index < len(doc):
+            # 如果指定了页码，只处理这一页
+            page_range = [page_index]
+        elif page_index is not None:
+             print(f"警告：指定的页码 {page_index} 超出文件范围 (0 - {len(doc) - 1})")
+             return []
+
+
+        for page_num in page_range:
+            page = doc[page_num]
+
+            scale_factor = 4.0 
+            mat = pymupdf.Matrix(scale_factor, scale_factor)
+            pix = page.get_pixmap(matrix=mat)
+
+            img_data = pix.tobytes("png")
+            pil_image = Image.open(io.BytesIO(img_data)).convert("RGB")
+            images.append(pil_image)
+
+            # pil_image.save(f"./data_output/{page_num}.png", format="PNG", quality=95)
+
+        doc.close()
+        print(f"Successfully converted {len(images)} pages from PDF")
+        return images
+
+    except Exception as e:
+        print(f"Error converting PDF to images: {str(e)}")
+        return []
+
+@overload
+def save_combined_pdf_results(all_page_results: List, pdf_path: str, save_dir: str) -> str:
+    ...
+
+@overload
+def save_combined_pdf_results(all_page_results: List, base_name: str, save_dir: str) -> str:
+    ...
+
+def save_combined_pdf_results(all_page_results, arg, save_dir):
+    if os.path.isfile(arg):
+        base_name = os.path.splitext(os.path.basename(arg))[0]
+    else:
+        base_name = arg
+    return _save_combined_pdf_results(all_page_results, base_name, save_dir)
+
+def _save_combined_pdf_results(all_page_results, base_name, save_dir):
+    """Save combined results for multi-page PDF with both JSON and Markdown
+
+    Args:
+        all_page_results: List of results for all pages
+        base_name: Base name of the PDF file
+        save_dir: Directory to save results
+
+    Returns:
+        Path to saved combined JSON file
+    """
+    # Prepare combined results
+    combined_results = {"source_file": "", "total_pages": len(all_page_results), "pages": all_page_results}
+
+    # Save combined JSON results
+    # json_filename = f"{base_name}.json"
+    json_filename = "all_combined.json"
+    json_path = os.path.join(save_dir, "recognition_json", json_filename)
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(combined_results, f, indent=2, ensure_ascii=False)
+
+    # Generate and save combined markdown
+    try:
+        markdown_converter = MarkdownConverter()
+
+        # Combine all page results into a single list for markdown conversion
+        all_elements = []
+        for page_data in all_page_results:
+            page_elements = page_data.get("elements", [])
+            if page_elements:
+                # Add page separator if not the first page
+                if all_elements:
+                    all_elements.append(
+                        {"label": "page_separator", "text": f"\n\n---\n\n", "reading_order": len(all_elements)}
+                    )
+                all_elements.extend(page_elements)
+
+        # Generate markdown content
+        markdown_content = markdown_converter.convert(all_elements)
+
+        # Save markdown file
+        markdown_filename = f"{base_name}.md"
+        markdown_path = os.path.join(save_dir, "markdown", markdown_filename)
+        os.makedirs(os.path.dirname(markdown_path), exist_ok=True)
+
+        with open(markdown_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+
+        # print(f"Combined markdown saved to: {markdown_path}")
+
+    except ImportError:
+        print("MarkdownConverter not available, skipping markdown generation")
+    except Exception as e:
+        print(f"Error generating markdown: {e}")
+
+    # print(f"Combined JSON results saved to: {json_path}")
+    return json_path
+
+
+def extract_labels_from_string(text):
+    """
+    from [202,217,921,325][para][author] extract para and author
+    """
+    all_matches = re.findall(r'\[([^\]]+)\]', text)
+    
+    labels = []
+    for match in all_matches:
+        if not re.match(r'^\d+,\d+,\d+,\d+$', match):
+            labels.append(match)
+    
+    return labels
+
+
+def parse_layout_string(bbox_str, a=1):
+    """
+    Dolphin-V1.5 layout string parsing function
+    Parse layout string to extract bbox and category information
+    Supports multiple formats:
+    1. Original format: [x1,y1,x2,y2] label
+    2. New format: [x1,y1,x2,y2][label][PAIR_SEP] or [x1,y1,x2,y2][label][meta_info][PAIR_SEP]
+    """
+    parsed_results = []
+    
+    segments = bbox_str.split('[PAIR_SEP]')
+    new_segments = []
+    for seg in segments:
+        new_segments.extend(seg.split('[RELATION_SEP]'))
+    segments = new_segments
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        
+        coord_pattern = r'\[(\d*\.?\d+),(\d*\.?\d+),(\d*\.?\d+),(\d*\.?\d+)\]'
+        coord_match = re.search(coord_pattern, segment)
+        label_matches = extract_labels_from_string(segment)
+        
+        if coord_match and label_matches:
+            coords = [float(coord_match.group(i)) * a for i in range(1, 5)]
+            label = label_matches[0].strip()
+            parsed_results.append((coords, label, label_matches[1:])) # label_matches[1:] 是 tags
+    
+    return parsed_results
+
+def process_coordinates2(coords, pil_image):
+    """
+    根据 Qwen-VL 的官方约定，使用 1000x1000 归一化因子
+    将模型坐标映射回原始 PIL Image 的像素坐标，忽略所有中间缩放。
+    """
+    original_w, original_h = pil_image.size[:2]
+    
+    # Qwen-VL 的核心约定：坐标归一化尺寸 S_norm = 1000
+    NORM_SIZE = 1000 
+    
+    # 映射公式： C_actual = C_model / NORM_SIZE * S_orig
+    w_ratio = original_w / NORM_SIZE
+    h_ratio = original_h / NORM_SIZE
+    
+    x1_model, y1_model, x2_model, y2_model = coords[0], coords[1], coords[2], coords[3]
+
+    # 映射到原始像素
+    x1 = int(x1_model * w_ratio)
+    y1 = int(y1_model * h_ratio)
+    x2 = int(x2_model * w_ratio)
+    y2 = int(y2_model * h_ratio)
+
+    # 边界检查 (确保不越界)
+    x1 = max(0, min(x1, original_w - 1))
+    y1 = max(0, min(y1, original_h - 1))
+    x2 = max(x1 + 1, min(x2, original_w))
+    y2 = max(y1 + 1, min(y2, original_h))
+    
+    return x1, y1, x2, y2
+
+def process_coordinates(coords, pil_image):
+    original_w, original_h = pil_image.size[:2]
+    # use the same resize logic as the model
+    resized_pil = resize_img(pil_image)
+    resized_image = np.array(resized_pil)
+    resized_h, resized_w = resized_image.shape[:2]
+    resized_h, resized_w = smart_resize(resized_h, resized_w, factor=16, min_pixels=784, max_pixels=2560000)
+
+    w_ratio, h_ratio = original_w / resized_w, original_h / resized_h
+    x1 = int(coords[0] * w_ratio)
+    y1 = int(coords[1] * h_ratio)
+    x2 = int(coords[2] * w_ratio)
+    y2 = int(coords[3] * h_ratio)
+
+    x1 = max(0, min(x1, original_w - 1))
+    y1 = max(0, min(y1, original_h - 1))
+    x2 = max(x1 + 1, min(x2, original_w))
+    y2 = max(y1 + 1, min(y2, original_h))
+    return x1, y1, x2, y2
+
+def setup_output_dirs(save_dir):
+    """Create necessary output directories"""
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "markdown"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "output_json"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "markdown", "figures"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "layout_visualization"), exist_ok=True)
+
+
+def save_outputs(recognition_results, image, image_name, save_dir):
+    """Save JSON and markdown outputs"""
+
+    # Save JSON file
+    json_dir = os.path.join(save_dir, "output_json")
+    os.makedirs(json_dir, exist_ok=True)
+
+    json_path = os.path.join(json_dir, f"{image_name}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(recognition_results, f, ensure_ascii=False, indent=2)
+
+    # Generate and save markdown file
+    markdown_converter = MarkdownConverter()
+    markdown_content = markdown_converter.convert(recognition_results)
+    markdown_path = os.path.join(save_dir, "markdown", f"{image_name}.md")
+    os.makedirs(os.path.dirname(markdown_path), exist_ok=True)
+    with open(markdown_path, "w", encoding="utf-8") as f:
+        f.write(markdown_content)
+
+    # visualize layout
+    # Save visualization (pass original PIL image for coordinate mapping)
+    vis_dir = os.path.join(save_dir, "layout_visualization")
+    os.makedirs(vis_dir, exist_ok=True)
+    vis_path = os.path.join(vis_dir, f"{image_name}_layout.png")
+
+    visualize_layout(image, recognition_results, vis_path)
+    return json_path
+
+
+def crop_margin(img: Image.Image) -> Image.Image:
+    """Crop margins from image"""
+    try:
+        width, height = img.size
+        if width == 0 or height == 0:
+            print("Warning: Image has zero width or height")
+            return img
+
+        data = np.array(img.convert("L"))
+        data = data.astype(np.uint8)
+        max_val = data.max()
+        min_val = data.min()
+        if max_val == min_val:
+            return img
+        data = (data - min_val) / (max_val - min_val) * 255
+        gray = 255 * (data < 200).astype(np.uint8)
+
+        coords = cv2.findNonZero(gray)  # Find all non-zero points (text)
+        if coords is None:
+            return img
+        a, b, w, h = cv2.boundingRect(coords)  # Find minimum spanning bounding box
+
+        # Ensure crop coordinates are within image bounds
+        a = max(0, a)
+        b = max(0, b)
+        w = min(w, width - a)
+        h = min(h, height - b)
+
+        # Only crop if we have a valid region
+        if w > 0 and h > 0:
+            return img.crop((a, b, a + w, b + h))
+        return img
+    except Exception as e:
+        print(f"crop_margin error: {str(e)}")
+        return img  # Return original image on error
+
+def visualize_layout(image_path, layout_results, save_path, alpha=0.3):
+    """Visualize layout detection results on the image
+    
+    Args:
+        image_path: Path to the input image
+        layout_results: List of (bbox, label, tags) dict
+        save_path: Path to save the visualization
+        alpha: Transparency of the overlay (0-1, lower = more transparent)
+    """
+    # Read image
+    if isinstance(image_path, str):
+        image = cv2.imread(image_path)
+    else:
+        # If it's already a PIL Image
+        image = cv2.cvtColor(np.array(image_path), cv2.COLOR_RGB2BGR)
+    
+    if image is None:
+        raise ValueError(f"Failed to load image from {image_path}")
+    
+    # Assign colors to all elements at once
+    element_colors = assign_colors_to_elements(len(layout_results))
+    
+    # Create overlay
+    overlay = image.copy()
+    
+    # Draw each layout element
+    for idx, layout_res in enumerate(layout_results):
+        if "bbox" not in layout_res:
+            return
+        bbox, label, reading_order, tags = layout_res["bbox"], layout_res["label"], layout_res["reading_order"], layout_res["tags"]
+       
+        x1,y1,x2,y2 = bbox 
+        
+        # Get color for this element (assigned by order, not by label)
+        color = element_colors[idx]
+        
+        # Draw filled rectangle with transparency
+        cv2.rectangle(overlay, (x1,y1), (x2,y2), color, -1)
+        
+        # Draw border
+        cv2.rectangle(image, (x1,y1), (x2,y2), color, 3)
+        
+        # Add label text with background at the top-left corner (outside the box)
+        label_text = f"{reading_order}: {label} | {tags}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        
+        # Get text size
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label_text, font, font_scale, thickness
+        )
+        
+        # Position text above the box (outside)
+        text_x = x1
+        text_y = y1 - 5  # 5 pixels above the box
+        
+        # If text would go outside the image at the top, put it inside the box instead
+        if text_y - text_height < 0:
+            text_y = y1 + text_height + 5
+        
+        # Draw text background
+        cv2.rectangle(
+            image,
+            (text_x - 2, text_y - text_height - 2),
+            (text_x + text_width + 2, text_y + baseline + 2),
+            (255, 255, 255),
+            -1
+        )
+        
+        # Draw text
+        cv2.putText(
+            image,
+            label_text,
+            (text_x, text_y),
+            font,
+            font_scale,
+            (0, 0, 0),
+            thickness
+        )
+    
+    # Blend the overlay with the original image
+    result = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+    
+    # Save the result
+    cv2.imwrite(save_path, result)
+    # print(f"Layout visualization saved to {save_path}")
+
+
+def get_color_palette():
+    """Get a visually pleasing color palette for layout visualization
+    
+    Returns:
+        List of BGR color tuples (semi-transparent, good for overlay)
+    """
+    # Carefully selected color palette with good visual distinction
+    # Colors are chosen to be light, pleasant, and distinguishable
+    color_palette = [
+        (200, 255, 255),  # Light cyan
+        (255, 200, 255),  # Light magenta
+        (255, 255, 200),  # Light yellow
+        (200, 255, 200),  # Light green
+        (255, 220, 200),  # Light orange
+        (220, 200, 255),  # Light purple
+        (200, 240, 255),  # Light sky blue
+        (255, 240, 220),  # Light peach
+        (220, 255, 240),  # Light mint
+        (255, 220, 240),  # Light pink
+        (240, 255, 200),  # Light lime
+        (240, 220, 255),  # Light lavender
+        (200, 255, 240),  # Light turquoise
+        (255, 240, 200),  # Light apricot
+        (220, 240, 255),  # Light periwinkle
+        (255, 200, 220),  # Light rose
+        (220, 255, 220),  # Light jade
+        (255, 230, 200),  # Light salmon
+        (210, 230, 255),  # Light cornflower
+        (255, 210, 230),  # Light carnation
+    ]
+    return color_palette
+
+
+def assign_colors_to_elements(num_elements):
+    """Assign colors to elements in order
+    
+    Args:
+        num_elements: Number of elements to assign colors to
+        
+    Returns:
+        List of color tuples, one for each element
+    """
+    palette = get_color_palette()
+    colors = []
+    
+    for i in range(num_elements):
+        # Cycle through the palette if we have more elements than colors
+        color_idx = i % len(palette)
+        colors.append(palette[color_idx])
+    
+    return colors
+
+def resize_img(image, max_size=1600, min_size=28):
+    return image
+
+def resize_img1(image, max_size=1600, min_size=28):
+    width, height = image.size
+    if max(width, height) < max_size and min(width, height) >= 28:
+        return image
+    
+    if max(width, height) > max_size:
+        if width > height:
+            new_width = max_size
+            new_height = int(height * (max_size / width))
+        else:
+            new_height = max_size
+            new_width = int(width * (max_size / height))
+        image = image.resize((new_width, new_height))
+        width, height = image.size
+    
+    if min(width, height) < 28:
+        if width < height:
+            new_width = min_size
+            new_height = int(height * (min_size / width))
+        else:
+            new_height = min_size
+            new_width = int(width * (min_size / height))
+        image = image.resize((new_width, new_height))
+
+    return image
+
+
+def calculate_iou_matrix(boxes):
+    """Vectorized IoU matrix calculation [N, N]
+    
+    Args:
+        boxes: List of bounding boxes in [x1, y1, x2, y2] format
+        
+    Returns:
+        numpy.ndarray: IoU matrix of shape [N, N]
+    """
+    boxes = np.array(boxes)  # [N, 4]
+    
+    # Calculate areas
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])  # [N]
+    
+    # Broadcast to calculate intersection
+    lt = np.maximum(boxes[:, None, :2], boxes[None, :, :2])  # [N, N, 2]
+    rb = np.minimum(boxes[:, None, 2:], boxes[None, :, 2:])  # [N, N, 2]
+    
+    wh = np.clip(rb - lt, 0, None)  # [N, N, 2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N, N]
+    
+    # Calculate IoU
+    union = areas[:, None] + areas[None, :] - inter
+    iou = inter / np.clip(union, 1e-6, None)
+    
+    return iou
+
+
+def check_bbox_overlap(layout_results_list, image, iou_threshold=0.1, overlap_box_ratio=0.25):
+    """Check if bounding boxes have significant overlaps, indicating a distorted/photographed document
+    
+    If more than 60% of boxes have overlaps (IoU > threshold with at least 1 other box),
+    treat as photographed document.
+    
+    Args:
+        layout_results_list: List of (bbox, label, tags) tuples
+        image: PIL Image object
+        iou_threshold: IoU threshold to consider two boxes as overlapping (default: 0.3)
+        overlap_box_ratio: Ratio threshold of boxes with overlaps (default: 0.6, i.e., 60%)
+    
+    Returns:
+        bool: True if significant overlap detected (should treat as distorted_page)
+    """
+    if len(layout_results_list) <= 1:
+        return False
+    
+    # Convert to absolute coordinates
+    bboxes = []
+    for bbox, label, tags in layout_results_list:
+        x1, y1, x2, y2 = process_coordinates(bbox, image)
+        bboxes.append([x1, y1, x2, y2])
+    
+    # Vectorized IoU matrix calculation
+    iou_matrix = calculate_iou_matrix(bboxes)
+    
+    # Check if each box has overlap with any other box (excluding itself)
+    overlap_mask = iou_matrix > iou_threshold
+    np.fill_diagonal(overlap_mask, False)  # Exclude self
+    has_overlap = overlap_mask.any(axis=1)  # Whether each box has overlap
+    
+    # Count boxes with overlaps
+    overlap_count = has_overlap.sum()
+    total_boxes = len(bboxes)
+    overlap_ratio = overlap_count / total_boxes
+    
+    # print(f"Overlap detection: {overlap_count}/{total_boxes} boxes have overlaps (ratio: {overlap_ratio:.2%})")
+    
+    # If more than 60% boxes have overlaps, treat as photographed document
+    if overlap_ratio > overlap_box_ratio:
+        print(f"⚠️ High overlap detected ({overlap_ratio:.2%} > {overlap_box_ratio:.2%}), treating as distorted/photographed document")
+        return True
+    
+    return False
+
+if __name__ == "__main__":
+    bbox_str = "[210,136,910,172][sec_0][PAIR_SEP][202,217,921,325][para][author][PAIR_SEP][520,341,604,367][para][PAIR_SEP][290,404,384,432][sec_1][paper_abstract][PAIR_SEP][156,448,520,723][para][paper_abstract][PAIR_SEP][125,740,290,768][sec_1][PAIR_SEP][125,781,552,1143][para][PAIR_SEP][125,1144,552,1400][para][RELATION_SEP][573,406,1000,561][para][PAIR_SEP][573,581,1001,943][para][PAIR_SEP][573,962,1001,1222][para][PAIR_SEP][573,1241,1001,1475][para][PAIR_SEP][126,1410,551,1470][fnote][PAIR_SEP][21,499,63,1163][watermark][meta_num]"
+    print(parse_layout_string(bbox_str))
