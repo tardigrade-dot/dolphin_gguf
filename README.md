@@ -31,3 +31,7 @@ conda install pytorch torchvision torchaudio -c pytorch
 
 dolphin-run --input_path /path/to/demo/zh_page_14.png --output_path /path/to/data_output
 
+#### 说明
+原始模型地址: https://github.com/bytedance/Dolphin
+存在的问题: 不同尺寸的输入文件和不同的服务器启动参数:n_batch输出的ocr第一阶段坐标会有所不同,所以在有些场景下不可用.
+目前在macOS中, n_batch 16 以及一个坐标修正参数(1.54)下, 部分尺寸的突破可以运行.
